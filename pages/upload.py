@@ -27,6 +27,7 @@ GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
 PINECONE_API_KEY = os.getenv("PINECONE_API_KEY")
 PINECONE_INDEX_NAME = os.getenv("PINECONE_INDEX_NAME")
 
+
 # API 키 확인
 if not GOOGLE_API_KEY:
     st.error("구글 API 키가 없습니다. .env 파일을 확인해주세요.")
@@ -62,6 +63,7 @@ with st.sidebar:
 # ==========================================
 def upload_to_google_drive(file_obj, filename):
     FOLDER_ID = os.getenv("FOLDER_ID")
+
     
     CLIENT_SECRET_FILE = 'client_secret.json'
     SCOPES = ['https://www.googleapis.com/auth/drive.file']
@@ -166,6 +168,7 @@ def get_multimodal_embedding(image, text: str):
                 output_dimensionality=EMBED_DIM  # 1408
             ),
         )
+
         return response.embeddings[0].values
     except Exception as e:
         print(f"임베딩 생성 실패: {e}")
@@ -233,6 +236,7 @@ def generate_tags(image):
 # ==========================================
 st.title("☁️ 한섬 AI 포토 클라우드 (New SDK)")
 st.caption("이미지 느낌 + 브랜드·태그 통합 벡터 저장 (Gemini 1408차원)")
+
 
 if "process_results" not in st.session_state:
     st.session_state.process_results = []
@@ -304,7 +308,6 @@ if start_btn and uploaded_files:
 
                 colors = " ".join(data.get('col', [])) if isinstance(data.get('col'), list) else str(data.get('col'))
                 if data.get('neck') in ["없음", "None"]: data['neck'] = ""
-
                 # 검색용 메타데이터 텍스트: 브랜드, 카테고리, 색상, 스타일, 소재, 넥라인, 핏, 디테일
                 metadata_text = f"{brand_name} {data.get('cat')} {colors} {data.get('sty')} {data.get('mat')} {data.get('neck')} {data.get('fit')} {data.get('det')}"
 
@@ -412,7 +415,6 @@ if st.session_state.process_results:
                     st.caption(
                         f"파일: `{result['filename']}` | 브랜드: **{result['brand']}** | 임베딩: `{result['embedding_dim']}차원`"
                     )
-                    
                     # ★ [추가] 이미지 느낌(Vibe) 보여주는 부분
                     st.markdown("**🌊 AI가 분석한 시각적 느낌:**")
                     st.info(result.get("vibe_text", "분석된 내용이 없습니다."))
