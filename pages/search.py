@@ -4,14 +4,16 @@
 - 탭2: Pinecone 기반 이미지 검색 (upload.py와 동일한 vibe+태그 임베딩)
 - 탭3: Google Cloud Vision WEB_DETECTION (웹 유사 이미지, DB 미사용)
 
-[벡터 DB 저장 형식 - upload.py 기준]
-저장 벡터 = embed( "{vibe 2~3문장} {brand} {cat} {colors} {sty} {mat} {neck} {fit} {det}" )
-→ 검색 쿼리도 동일한 순서·구조로 생성해야 유사도 정확도가 높아짐
+[정확도 개선 전략 - 성별/연령 하드 필터]
+upload.py가 Pinecone에 저장하는 최상위 메타데이터: brand, category, style, vibe, detail_json
+→ gen(성별), age(연령대)는 detail_json 내부에만 존재 → Pinecone filter 파라미터 직접 사용 불가
 
-[이미지 로딩 방식]
-drive.google.com/thumbnail URL은 Rate Limit·세션 검증 문제로 간헐적 실패 발생.
-→ upload.py와 동일한 token.pickle OAuth 인증으로 Drive API에서 직접 bytes 수신.
-→ st.cache_data로 세션 내 캐싱해 중복 API 호출 방지.
+해결책: post-filter 방식
+  1. top_k=50으로 넉넉하게 후보 수집
+  2. detail_json 파싱 → gen/age 필드 추출
+  3. 성별 하드 필터(여성 쿼리면 남성 결과 제거) 적용
+  4. 연령대 소프트 필터(점수 조정) 적용
+  5. 최종 상위 N개만 표시
 """
 import os
 import re
@@ -25,15 +27,12 @@ from dotenv import load_dotenv
 from pinecone import Pinecone
 from PIL import Image
 
-# 구글 신형 SDK (upload와 동일)
 from google import genai
 from google.genai import types
-
-# 구글 드라이브 이미지 로딩용 (upload.py와 동일한 인증 방식)
 import requests as _requests
 from google.auth.transport.requests import Request
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
-# Google Cloud Vision (이미지 웹 유사도 검색용, optional)
 try:
     from google.cloud import vision
     VISION_AVAILABLE = True
@@ -42,7 +41,6 @@ except ImportError:
 
 load_dotenv()
 
-# Vision API용 서비스 계정 경로 (.env에서 불러와서 환경변수로 설정)
 _cred_path = os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
 if _cred_path:
     os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = _cred_path
@@ -62,17 +60,21 @@ client = genai.Client(api_key=GOOGLE_API_KEY)
 
 
 # ==========================================
-# [0] Google Drive 이미지 로딩 (Google CDN 방식)
+# [0] Google Drive 이미지 로딩 (서버사이드 bytes 방식)
 # ==========================================
-# [문제] drive.google.com/thumbnail → Rate Limit·세션 검증으로 간헐적 실패
-#        Bearer 토큰 방식 → 토큰 만료 타이밍에 간헐적 실패
-# [해결] lh3.googleusercontent.com/d/{file_id}
-#        → 구글 공식 이미지 CDN. 파일이 "링크 공유" 상태면 인증 불필요.
-#        → Rate Limit 없음, 세션 검증 없음, 항상 안정적.
-# [Fallback] CDN 실패 시 requests + Bearer 토큰으로 bytes 직접 수신
+def prefetch_images(results: list):
+    file_ids = [drive_link_to_file_id(r["drive_link"]) for r in results if r.get("drive_link")]
+    file_ids = [fid for fid in file_ids if fid]
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        futures = {executor.submit(_fetch_image_bytes_cached, fid): fid for fid in file_ids}
+        for future in as_completed(futures):
+            try:
+                future.result()
+            except Exception:
+                pass
+
 
 def drive_link_to_file_id(drive_link: Optional[str]) -> Optional[str]:
-    """drive_link(webViewLink)에서 파일 ID만 추출."""
     if not drive_link:
         return None
     m = re.search(r"/file/d/([a-zA-Z0-9_-]+)", drive_link)
@@ -80,7 +82,6 @@ def drive_link_to_file_id(drive_link: Optional[str]) -> Optional[str]:
 
 
 def _get_bearer_token() -> Optional[str]:
-    """token.pickle에서 OAuth Bearer 토큰 추출. 만료 시 자동 갱신."""
     if not os.path.exists('token.pickle'):
         return None
     try:
@@ -96,47 +97,66 @@ def _get_bearer_token() -> Optional[str]:
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
-def get_drive_image_bytes_fallback(file_id: str) -> Optional[bytes]:
-    """
-    CDN 실패 시 Bearer 토큰으로 Drive API에서 직접 bytes 수신 (최후 수단).
-    st.cache_data는 순수 bytes만 캐싱 → 직렬화 문제 없음.
-    """
+def _fetch_image_bytes_cached(file_id: str) -> Optional[bytes]:
     token = _get_bearer_token()
-    if not token:
-        return None
+    if token:
+        try:
+            resp = _requests.get(
+                f"https://www.googleapis.com/drive/v3/files/{file_id}?alt=media",
+                headers={"Authorization": f"Bearer {token}"},
+                timeout=15,
+            )
+            if resp.status_code == 200 and resp.content:
+                return resp.content
+        except Exception:
+            pass
+
     try:
         resp = _requests.get(
-            f"https://www.googleapis.com/drive/v3/files/{file_id}?alt=media",
-            headers={"Authorization": f"Bearer {token}"},
-            timeout=15,
+            f"https://lh3.googleusercontent.com/d/{file_id}",
+            timeout=10,
+            headers={"User-Agent": "Mozilla/5.0"},
         )
-        return resp.content if resp.status_code == 200 else None
+        if resp.status_code == 200 and resp.content:
+            return resp.content
     except Exception:
-        return None
+        pass
+
+    try:
+        resp = _requests.get(
+            f"https://drive.google.com/thumbnail?id={file_id}&sz=w400",
+            timeout=10,
+            headers={"User-Agent": "Mozilla/5.0"},
+        )
+        if resp.status_code == 200 and resp.content:
+            return resp.content
+    except Exception:
+        pass
+
+    return None
 
 
 def render_drive_image(drive_link: Optional[str]):
-    """
-    Drive 이미지를 안정적으로 렌더링. 3단계 fallback 구조.
-    1순위: lh3.googleusercontent.com CDN URL → 인증 불필요, Rate Limit 없음
-    2순위: Bearer 토큰 bytes → CDN 접근 불가 환경 대비
-    3순위: thumbnail URL → 최후 수단
-    """
     file_id = drive_link_to_file_id(drive_link)
     if not file_id:
         st.caption("(이미지 없음)")
         return
-
-    # 1순위: 구글 이미지 CDN (공개 공유 파일에 가장 안정적)
-    cdn_url = f"https://lh3.googleusercontent.com/d/{file_id}"
-    st.image(cdn_url, use_container_width=True)
+    img_bytes = _fetch_image_bytes_cached(file_id)
+    if img_bytes:
+        try:
+            st.image(img_bytes, use_container_width=True)
+            return
+        except Exception:
+            pass
+    st.caption("⚠️ 이미지 로딩 실패")
+    if drive_link:
+        st.markdown(f"[🔗 Drive에서 직접 열기]({drive_link})")
 
 
 # ==========================================
-# [1] 텍스트 임베딩 (upload와 동일 1408차원)
+# [1] 텍스트 임베딩
 # ==========================================
 def get_text_embedding(text: str):
-    """업로드 시와 동일한 gemini-embedding-001, 1408차원."""
     try:
         response = client.models.embed_content(
             model="gemini-embedding-001",
@@ -150,61 +170,70 @@ def get_text_embedding(text: str):
 
 
 # ==========================================
-# [2] 자연어 → DB 인덱싱 형식에 맞는 검색 쿼리 생성 (Gemini)
+# [2] 자연어 → 구조화 쿼리 (정확도 개선 버전)
 # ==========================================
-# [핵심] DB에 저장된 벡터는 아래 두 부분을 합친 텍스트로 생성됨:
-#   ① vibe 설명 (2~3문장): 이미지 분위기·무드·색감·스타일 감성
-#   ② 메타데이터 키워드: "{brand} {cat} {colors} {sty} {mat} {neck} {fit} {det}"
-# → query_text도 동일한 구조 ① + ② 로 생성해야 벡터 공간에서 정확히 매칭됨
 def structure_query_for_search(user_query: str) -> Optional[dict]:
     """
     사용자 자연어를 Gemini로 구조화.
-    query_text = ① 분위기 묘사 1~2문장 + ② 핵심 키워드 나열 (upload.py 저장 형식과 동일한 구조)
+    gen(성별), age(연령대) 필드를 정확히 추출하는 것이 핵심.
+    query_text는 DB 저장 형식(vibe + 메타데이터)과 동일한 구조로 생성.
     """
     prompt = """
-    Role: You are a Senior Fashion Search Expert with 20 years of experience at Handsome.
-    Task: Convert user's natural language into an optimized vector search query matching our DB indexing format.
-    Constraints: Output ONLY JSON (no markdown, no code fence). Values in Korean.
+Role: You are a Senior Fashion Search Expert at Handsome with 20 years of experience.
+Task: Convert user's natural language into a structured search query.
+Output: ONLY valid JSON. Korean values only. No markdown, no explanation.
 
-    [DB 인덱싱 형식 - 검색 쿼리가 반드시 이 구조를 따라야 합니다]
-    저장된 벡터는 아래 두 부분을 이어붙인 텍스트로 생성됩니다:
-      ① 이미지 분위기 설명 (2~3문장): "차분하고 세련된 분위기의 미니멀한 룩이다. 고급스러운 소재감과 절제된 색감이 인상적이다."
-      ② 메타데이터 키워드 나열: "{카테고리} {색상} {스타일} {소재} {넥라인} {핏} {디테일}"
+[Critical extraction rules]
+- gen(성별): MUST be extracted precisely.
+  - "남성", "남자", "남" → "남성"
+  - "여성", "여자", "여" → "여성"
+  - "남녀", "커플", "unisex" → "남녀공용"
+  - 언급 없으면 → "" (빈 문자열, 절대 추정하지 말 것)
+- age(연령대): "10대", "20대", "30대", "3040", "4050", "전연령" 중에서 추출. 언급 없으면 "".
+- cat(카테고리): 코트/자켓/점퍼/가디건/니트/셔츠/블라우스/티셔츠/팬츠/데님/스커트/원피스/정장/스웨터/슈즈/백/액세서리 등. 언급 없으면 "".
+- occasion(착용 상황): 소개팅/데이트/출근/결혼식/하객/캐주얼/스포츠 등. 새로운 필드로 추출.
 
-    [JSON 구조 - 항상 모든 키 포함]
-    {
-      "cat": "Item Name", "col": ["Color"], "mat": "Material",
-      "pat": "Pattern", "sty": "Style", "sea": "Season",
-      "neck": "Neckline", "fit": "Fit", "det": ["Detail"],
-      "mon": ["Suitable Month (e.g., 3월, 4월, 10월)"],
-      "gen": "Target Gender/Category (e.g., 여성, 남성, 남녀공용, 신발, 가방, 잡화)",
-      "age": "Target Age Group (e.g., 20대, 3040, 전연령)",
-      "query_text": "① 분위기 1~2문장. ② 카테고리 색상 스타일 소재 핏 키워드 나열"
-    }
+[Color normalization]
+검정→블랙, 흰색→화이트, 회색→그레이, 아이보리/오프화이트→아이보리
 
-    [정규화 규칙]
-    - 색상: 검정→블랙, 흰색→화이트, 회색→그레이, 아이보리/오프화이트→아이보리
-    - 핏: 슬림핏/레귤러핏/루즈핏/오버핏/크롭/롱/와이드/스트레이트 중 택1
-    - 소재: 울/캐시미어/면/데님/가죽/트위드/린넨/폴리/니트 등 단어형으로
-    - 카테고리: 코트/자켓/점퍼/가디건/니트/셔츠/블라우스/티셔츠/팬츠/데님/스커트/원피스/정장/스웨터 등
+[Fit normalization]
+슬림핏/레귤러핏/루즈핏/오버핏/크롭/롱/와이드/스트레이트 중 1개
 
-    [query_text 작성 규칙]
-    - 사용자가 언급하지 않은 속성은 절대 추가하지 말 것
-    - ① 분위기 문장: 사용자 의도에서 유추되는 무드·감성·착용감을 자연스러운 한국어 문장으로
-    - ② 키워드: 카테고리→색상→스타일→소재→핏→디테일 순서로 단어 나열
-    - 동의어가 도움되면 함께 포함 (예: 하객룩 결혼식, 블레이저 자켓)
+[query_text construction rules]
+DB에 저장된 벡터는 "이미지 분위기 문장 + 메타데이터 키워드" 형식으로 임베딩됨.
+query_text도 반드시 같은 형식으로 작성:
+  ① 분위기/무드/상황 묘사 문장 (1~2문장, 자연스러운 한국어)
+  ② 키워드 나열: 카테고리 색상 스타일 소재 핏 디테일 착용상황
 
-    [query_text 예시]
-    입력: "결혼식 갈 때 입을 블랙 트위드 자켓"
-    출력 query_text: "클래식하고 단정한 포멀 분위기의 고급스러운 룩이다. 하객룩으로 잘 어울리는 세련된 스타일이다. 자켓 블랙 트위드 클래식 포멀 하객룩 결혼식"
+[query_text examples]
+입력: "20대 남성 소개팅 룩 추천해줘"
+query_text: "깔끔하고 세련된 무드의 남성 캐주얼 룩이다. 소개팅에 잘 어울리는 단정하면서도 스타일리시한 느낌이다. 남성 캐주얼 소개팅 데이트 클린핏"
 
-    입력: "여름에 시원한 린넨 와이드 팬츠"
-    출력 query_text: "시원하고 자연스러운 내추럴 무드의 편안한 캐주얼 룩이다. 여름 데일리로 활용하기 좋은 가벼운 느낌이다. 팬츠 린넨 캐주얼 와이드핏 여름"
+입력: "결혼식 갈 때 입을 블랙 트위드 자켓"
+query_text: "클래식하고 단정한 포멀 분위기의 고급스러운 룩이다. 하객룩으로 잘 어울리는 세련된 스타일이다. 자켓 블랙 트위드 클래식 포멀 하객룩 결혼식"
 
-    입력: "오버사이즈 베이지 울 코트"
-    출력 query_text: "따뜻하고 여유로운 무드의 고급스러운 겨울 룩이다. 클래식하면서도 세련된 오버핏 실루엣이 인상적이다. 코트 베이지 울 클래식 오버핏 가을겨울"
+입력: "여름 린넨 와이드 팬츠"
+query_text: "시원하고 자연스러운 내추럴 무드의 편안한 캐주얼 룩이다. 여름 데일리로 활용하기 좋은 가벼운 느낌이다. 팬츠 린넨 캐주얼 와이드핏 여름"
 
-    User input: """
+[Required JSON schema]
+{
+  "cat": "",
+  "col": [],
+  "mat": "",
+  "pat": "",
+  "sty": "",
+  "sea": "",
+  "neck": "",
+  "fit": "",
+  "det": [],
+  "mon": [],
+  "gen": "",
+  "age": "",
+  "occasion": "",
+  "query_text": ""
+}
+
+User input: """
 
     try:
         response = client.models.generate_content(
@@ -212,7 +241,6 @@ def structure_query_for_search(user_query: str) -> Optional[dict]:
             contents=prompt + user_query.strip(),
         )
         text = (response.text or "").strip()
-        # strip markdown code block if present
         if text.startswith("```"):
             text = re.sub(r"^```(?:json)?\s*", "", text)
             text = re.sub(r"\s*```$", "", text)
@@ -223,53 +251,29 @@ def structure_query_for_search(user_query: str) -> Optional[dict]:
 
 
 # ==========================================
-# [3] 이미지 → 분위기 텍스트 (upload.py와 완전히 동일)
+# [3] 이미지 → 분위기 텍스트
 # ==========================================
-# [핵심] DB 벡터의 앞부분(①)이 이 함수의 출력으로 생성됨
-# → 검색 시에도 동일한 프롬프트·모델로 vibe를 추출해야 벡터 공간이 일치함
 def generate_image_vibe_description(image) -> str:
-    """
-    이미지를 보고 시각적 분위기, 무드, 색감, 스타일 감성을 2~3문장 한글로 설명.
-    반환된 문자열은 검색용 통합 텍스트 앞쪽에 붙여서 임베딩에 사용됩니다.
-    """
     prompt = """이 패션/의류 이미지의 시각적 느낌을 설명해주세요.
 - 분위기(무드), 색감, 전체적인 스타일 감성, 착용감에 대한 인상을 2~3문장 한글로만 작성해주세요.
 - JSON이나 목록 형식 없이, 연속된 문단(플레인 텍스트)으로만 답하세요.
 - 다른 설명이나 접두어 없이 바로 본문만 출력하세요."""
 
-    candidate_models = [
-        "gemini-2.0-flash",
-        "gemini-2.5-flash",
-        "gemini-2.5-flash-preview-05-20",
-    ]
-    last_error = ""
-    for model_name in candidate_models:
+    for model_name in ["gemini-2.0-flash", "gemini-2.5-flash", "gemini-2.5-flash-preview-05-20"]:
         try:
-            response = client.models.generate_content(
-                model=model_name,
-                contents=[prompt, image],
-            )
+            response = client.models.generate_content(model=model_name, contents=[prompt, image])
             text = (response.text or "").strip()
             if text:
                 return text
-        except Exception as e:
-            last_error = str(e)
+        except Exception:
             continue
-    # 모두 실패 시 빈 문자열 반환 (메타데이터만으로도 임베딩은 가능)
-    print(f"이미지 느낌 설명 생성 실패(무시 후 진행): {last_error}")
     return ""
 
 
 # ==========================================
-# [4] 이미지 → 태그 JSON (upload.py와 완전히 동일)
+# [4] 이미지 → 태그 JSON
 # ==========================================
-# [핵심] DB 벡터의 뒷부분(②)이 이 함수의 출력으로 구성된 metadata_text임
-# → 동일한 프롬프트·모델로 태그를 추출해야 키워드 공간이 일치함
 def generate_tags(image) -> str:
-    """
-    이미지 태그를 JSON으로 추출. upload.py와 완전히 동일한 프롬프트·로직 사용.
-    반환된 JSON은 파싱 후 metadata_text 구성에 사용됩니다.
-    """
     prompt = """
     Role: You are a Senior Merchandiser (MD) at Handsome with 20 years of experience.
     Task: Analyze the visual elements of the image and extract structured data for search optimization.
@@ -284,17 +288,10 @@ def generate_tags(image) -> str:
       "age": "Target Age Group (e.g., 20대, 3040, 전연령)"
     }
     """
-    candidate_models = [
-        'gemini-2.0-flash',
-        'gemini-2.5-flash',
-    ]
     last_error = ""
-    for model_name in candidate_models:
+    for model_name in ['gemini-2.0-flash', 'gemini-2.5-flash']:
         try:
-            response = client.models.generate_content(
-                model=model_name,
-                contents=[prompt, image]
-            )
+            response = client.models.generate_content(model=model_name, contents=[prompt, image])
             text = response.text.strip()
             if text.startswith("```json"): text = text[7:]
             if text.startswith("```"): text = text[3:]
@@ -307,26 +304,34 @@ def generate_tags(image) -> str:
 
 
 # ==========================================
-# [5] Pinecone 검색 공통 함수
+# [5] Pinecone 검색 (후처리 필터용 top_k 확대)
 # ==========================================
-def pinecone_query(vector, top_k: int = 20) -> list:
-    """벡터로 Pinecone를 조회해 메타데이터가 포함된 결과 리스트 반환."""
+def pinecone_query(vector, top_k: int = 50) -> list:
+    """
+    벡터 검색. top_k를 크게 설정해 post-filter 이후에도 충분한 결과 확보.
+    detail_json도 함께 파싱해 gen/age 필드를 result에 포함.
+    """
     try:
         pc = Pinecone(api_key=PINECONE_API_KEY)
         index = pc.Index(PINECONE_INDEX_NAME)
-        res = index.query(
-            vector=vector,
-            top_k=top_k,
-            include_metadata=True,
-        )
+        res = index.query(vector=vector, top_k=top_k, include_metadata=True)
     except Exception as e:
         st.error(f"Pinecone 검색 실패: {e}")
         return []
+
     matches = getattr(res, "matches", None) or res.get("matches", [])
     results = []
     for m in matches:
         meta = (getattr(m, "metadata", None) or m.get("metadata")) or {}
         score = getattr(m, "score", None) or m.get("score") or 0
+
+        # detail_json 파싱해서 gen/age 추출 (post-filter에 사용)
+        detail_json_str = meta.get("detail_json", "")
+        try:
+            detail_obj = json.loads(detail_json_str) if isinstance(detail_json_str, str) else detail_json_str
+        except Exception:
+            detail_obj = {}
+
         results.append({
             "score": score,
             "brand": meta.get("brand", ""),
@@ -334,16 +339,167 @@ def pinecone_query(vector, top_k: int = 20) -> list:
             "style": meta.get("style", ""),
             "drive_link": meta.get("drive_link", ""),
             "original_name": meta.get("original_name", ""),
-            "detail_json": meta.get("detail_json", ""),
+            "detail_json": detail_json_str,
+            # post-filter용 필드
+            "gen": detail_obj.get("gen", ""),
+            "age": detail_obj.get("age", ""),
         })
     return results
 
 
 # ==========================================
-# [6] 결과 필터 + 렌더링 공통 함수
+# [6] 핵심: 구조화 쿼리 기반 후처리 필터 + 정렬
+# ==========================================
+
+# [gen 하드 필터 규칙]
+# "남성" 쿼리 → "남성", "남녀공용" 허용 / "여성" 완전 제거
+# "여성" 쿼리 → "여성", "남녀공용" 허용 / "남성" 완전 제거
+GEN_EXCLUDE_MAP = {
+    "남성": ["여성"],
+    "여성": ["남성"],
+    "남녀공용": [],
+    "": [],
+}
+
+# [age 소프트 필터]
+# 일치: ×1.1 보너스 / 불일치: ×0.7 페널티
+AGE_GROUPS = {
+    "10대": ["10대"],
+    "20대": ["20대"],
+    "30대": ["3040", "30대"],
+    "3040": ["3040", "30대", "40대"],
+    "4050": ["4050", "40대", "50대"],
+    "전연령": None,  # None = 항상 허용
+}
+
+# [카테고리 소프트 필터]
+# 일치: ×1.3 보너스 / 불일치: ×0.35 페널티 (연령보다 훨씬 강한 가중치)
+#
+# 동의어 그룹: DB에 저장된 카테고리 표기가 다양할 수 있으므로
+# 같은 의미의 카테고리를 묶어 유연하게 매칭.
+CATEGORY_SYNONYM_GROUPS: List[set] = [
+    {"자켓", "재킷", "블레이저"},
+    {"코트", "오버코트", "트렌치코트", "트렌치"},
+    {"팬츠", "바지", "슬랙스", "트라우저"},
+    {"데님", "청바지", "진"},
+    {"스커트", "치마"},
+    {"원피스", "드레스"},
+    {"니트", "스웨터", "풀오버"},
+    {"가디건"},
+    {"셔츠", "남방"},
+    {"블라우스", "블라우즈"},
+    {"티셔츠", "티", "반팔", "롱슬리브", "탑"},
+    {"점퍼", "패딩", "다운", "아우터"},
+    {"정장", "수트", "슈트"},
+    {"슈즈", "신발", "구두", "스니커즈", "운동화", "로퍼", "부츠", "샌들"},
+    {"백", "가방", "파우치", "크로스백", "숄더백", "토트백", "클러치"},
+    {"액세서리", "주얼리", "목걸이", "귀걸이", "반지", "벨트", "스카프", "모자"},
+]
+
+def _norm_cat(cat: str) -> str:
+    """카테고리 소문자·공백 제거 정규화."""
+    return cat.strip().lower().replace(" ", "")
+
+def _category_matches(query_cat: str, result_cat: str) -> bool:
+    """
+    쿼리 카테고리와 결과 카테고리가 같은 동의어 그룹이거나
+    부분 문자열 포함 관계이면 True (일치로 판정).
+    """
+    if not query_cat or not result_cat:
+        return False  # 한쪽이 비어있으면 판정 불가 → 중립 처리(호출부에서 분기)
+
+    q = _norm_cat(query_cat)
+    r = _norm_cat(result_cat)
+
+    if q == r:
+        return True
+
+    # 동의어 그룹 매칭
+    for group in CATEGORY_SYNONYM_GROUPS:
+        normed = {_norm_cat(c) for c in group}
+        if q in normed and r in normed:
+            return True
+
+    # 부분 문자열 포함 (예: 쿼리="트렌치" → result="트렌치코트" 허용)
+    return q in r or r in q
+
+
+def apply_post_filters(
+    results: list,
+    structured: dict,
+    display_n: int = 12,
+) -> list:
+    """
+    Pinecone 벡터 검색 결과에 필터·가중치를 적용해 재정렬.
+
+    필터 종류 및 가중치:
+      - 성별   : 하드 필터 (불일치 시 완전 제거)
+      - 카테고리: 소프트 필터, 가중치 ★★★ (일치 ×1.3 / 불일치 ×0.35)
+      - 연령대 : 소프트 필터, 가중치 ★   (일치 ×1.1 / 불일치 ×0.7)
+    """
+    query_gen = (structured.get("gen") or "").strip()
+    query_age = (structured.get("age") or "").strip()
+    query_cat = (structured.get("cat") or "").strip()
+
+    exclude_gens = GEN_EXCLUDE_MAP.get(query_gen, [])
+
+    filtered = []
+    for r in results:
+        result_gen = (r.get("gen") or "").strip()
+        result_age = (r.get("age") or "").strip()
+        result_cat = (r.get("category") or "").strip()  # Pinecone 최상위 메타데이터에서 바로 사용
+        score = r["score"]
+
+        # ── 하드 필터: 성별 (불일치 시 완전 제거) ────
+        if result_gen in exclude_gens:
+            continue
+
+        # ── 소프트 필터: 카테고리 (가중치 최강) ──────
+        # 카테고리가 쿼리에 명시된 경우에만 적용
+        if query_cat:
+            if not result_cat:
+                # DB에 카테고리 정보 없음 → 중립 (페널티 없음)
+                pass
+            elif _category_matches(query_cat, result_cat):
+                # 카테고리 일치 → 강한 보너스
+                score = min(score * 1.3, 1.0)
+            else:
+                # 카테고리 불일치 → 강한 페널티 (결과에서 제거하지는 않음)
+                score = score * 0.35
+
+        # ── 소프트 필터: 연령대 (카테고리보다 약한 가중치) ──
+        if query_age and query_age != "전연령":
+            allowed_ages = AGE_GROUPS.get(query_age, [query_age])
+            if allowed_ages is not None:
+                if result_age == "전연령" or not result_age:
+                    pass  # 연령 정보 없음 → 중립
+                elif result_age in allowed_ages:
+                    score = min(score * 1.1, 1.0)   # 일치 보너스
+                else:
+                    score = score * 0.7             # 불일치 페널티
+
+        # ── 유사도 임계값 필터: 조정된 score가 0.5 미만이면 제거 ──
+        if score < 0.5:
+            continue
+
+        # ── 유사도 임계값: 조정된 score 0.5 미만이면 제거 ──
+        if score < 0.5:
+            continue
+
+        filtered.append({**r, "score": score})
+
+    # 조정된 점수로 재정렬 후 상위 N개 반환
+    filtered.sort(key=lambda x: x["score"], reverse=True)
+    return filtered[:display_n]
+
+
+# ==========================================
+# [7] 결과 필터 + 렌더링 공통 함수
 # ==========================================
 def render_search_results(results: list, filter_key_prefix: str):
-    """필터 UI + 이미지 그리드 렌더링. 탭1·탭2 공통 사용."""
+    with st.spinner("🖼️ 이미지 로딩 중..."):
+        prefetch_images(results)
+
     all_brands = ["전체"] + sorted({r["brand"] for r in results if r["brand"]})
     all_cats   = ["전체"] + sorted({r["category"] for r in results if r["category"]})
     all_styles = ["전체"] + sorted({r["style"] for r in results if r["style"]})
@@ -372,14 +528,12 @@ def render_search_results(results: list, filter_key_prefix: str):
         for idx, r in enumerate(row_items):
             with cols[idx]:
                 with st.container(border=True):
-                    # render_drive_image: Drive API bytes → fallback URL 순으로 시도
                     render_drive_image(r["drive_link"])
                     st.caption(f"**유사도:** {r['score']:.3f}")
                     st.caption(f"**파일:** {r['original_name']}")
                     st.caption(
                         f"**브랜드:** {r['brand']} | **카테고리:** {r['category']} | **스타일:** {r['style']}"
                     )
-                    # 원본 Drive 링크 — 이미지 로딩 실패 시 원본 존재 여부 직접 확인용
                     if r["drive_link"]:
                         st.markdown(f"[🔗 원본 Drive 파일 보기]({r['drive_link']})", unsafe_allow_html=False)
                     detail = r.get("detail_json")
@@ -393,13 +547,9 @@ def render_search_results(results: list, filter_key_prefix: str):
 
 
 # ==========================================
-# [7] Google Cloud Vision WEB_DETECTION (이미지 → 웹 유사 이미지)
+# [8] Vision API WEB_DETECTION
 # ==========================================
 def run_web_detection(image_bytes: bytes) -> Tuple[List[str], List[str], List[Tuple[str, str]]]:
-    """
-    Vision API WEB_DETECTION만 사용.
-    Returns: (best_guess_labels, visually_similar_image_urls, [(page_url, page_title)])
-    """
     if not VISION_AVAILABLE:
         return [], [], []
     vision_client = vision.ImageAnnotatorClient()
@@ -427,7 +577,7 @@ def url_to_domain(url: str) -> str:
 
 
 # ==========================================
-# [UI] 검색 화면 (탭)
+# [UI]
 # ==========================================
 st.set_page_config(page_title="이미지 검색", layout="wide")
 st.title("🔍 이미지 검색")
@@ -441,24 +591,46 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
+# session_state 초기화
+for _key, _default in [
+    ("search_results",     []),
+    ("structured_query",   {}),
+    ("img_search_results", []),
+    ("img_search_vibe",    ""),
+    ("img_search_tags",    {}),
+    ("tab1_reset_counter", 0),
+    ("tab2_reset_counter", 0),
+]:
+    if _key not in st.session_state:
+        st.session_state[_key] = _default
+
 tab1, tab2, tab3 = st.tabs(["📝 텍스트로 검색", "🖼️ 이미지로 검색", "🌐 이미지로 웹 유사도 검색"])
 
 
 # ──────────────────────────────────────────
-# 탭1: 텍스트로 검색 (Pinecone)
+# 탭1: 텍스트로 검색
 # ──────────────────────────────────────────
 with tab1:
     st.caption("원하는 스타일을 문장으로 입력하면 유사 이미지를 찾아줍니다. (Gemini 1408차원 + Pinecone)")
+
     query_input = st.text_input(
         "검색어",
-        placeholder="예: 결혼식 갈 때 입기 좋은 옷",
+        placeholder="예: 20대 남성 소개팅 룩 추천해줘",
         label_visibility="collapsed",
-        key="text_query_input",
+        key=f"text_query_input_{st.session_state.tab1_reset_counter}",
     )
-    search_clicked = st.button("🔍 검색", type="primary", use_container_width=True, key="text_search_btn")
 
-    if "search_results" not in st.session_state:
-        st.session_state.search_results = []
+    btn_col1, btn_col2 = st.columns([5, 1])
+    with btn_col1:
+        search_clicked = st.button("🔍 검색", type="primary", use_container_width=True, key="text_search_btn")
+    with btn_col2:
+        reset_clicked  = st.button("🔄 초기화", use_container_width=True, key="text_reset_btn")
+
+    if reset_clicked:
+        st.session_state.search_results   = []
+        st.session_state.structured_query = {}
+        st.session_state.tab1_reset_counter += 1
+        st.rerun()
 
     if search_clicked and query_input.strip():
         with st.spinner("쿼리 구조화 및 검색 중..."):
@@ -466,33 +638,63 @@ with tab1:
             if not structured:
                 st.stop()
 
-            # query_text = ① 분위기 문장 + ② 키워드 나열 (DB 저장 형식과 동일한 구조)
             query_text = structured.get("query_text") or query_input.strip()
 
-            with st.expander("📋 구조화된 쿼리 (JSON)"):
-                st.json(structured)
+            # 구조화된 쿼리 + 적용된 필터 정보 표시
+            with st.expander("📋 구조화된 쿼리 및 적용 필터"):
+                col_a, col_b = st.columns(2)
+                with col_a:
+                    st.markdown("**추출된 조건**")
+                    filter_info = {
+                        "성별(하드필터)": structured.get("gen") or "미지정(전체)",
+                        "카테고리(소프트★★★)": structured.get("cat") or "미지정(전체)",
+                        "연령대(소프트★)": structured.get("age") or "미지정(전체)",
+                        "착용상황": structured.get("occasion") or "미지정",
+                    }
+                    for k, v in filter_info.items():
+                        st.markdown(f"- **{k}**: {v}")
+                with col_b:
+                    st.markdown("**전체 JSON**")
+                    st.json(structured)
 
             vector = get_text_embedding(query_text)
             if not vector:
                 st.stop()
 
-            st.session_state.search_results   = pinecone_query(vector)
+            # top_k=50으로 넉넉하게 수집 후 post-filter
+            raw_results = pinecone_query(vector, top_k=50)
+            filtered_results = apply_post_filters(raw_results, structured, display_n=12)
+
+            st.session_state.search_results   = filtered_results
             st.session_state.structured_query = structured
+
+            # 필터 적용 결과 안내
+            gen = structured.get("gen")
+            age = structured.get("age")
+            cat = structured.get("cat")
+            if gen or age or cat:
+                filter_desc = []
+                if gen:
+                    filter_desc.append(f"성별: **{gen}**")
+                if cat:
+                    filter_desc.append(f"카테고리: **{cat}** (강)")
+                if age:
+                    filter_desc.append(f"연령대: **{age}** (약)")
+                st.info(f"🔍 필터 적용됨 — {' | '.join(filter_desc)} | 후보 {len(raw_results)}건 → 최종 {len(filtered_results)}건")
 
     if st.session_state.search_results:
         render_search_results(st.session_state.search_results, filter_key_prefix="tab1")
     elif search_clicked and not query_input.strip():
         st.warning("검색어를 입력해주세요.")
+    elif search_clicked and st.session_state.search_results == []:
+        st.info("유사도 0.5 이상의 결과가 없습니다. 검색어를 바꿔 다시 시도해보세요.")
+    elif search_clicked and not st.session_state.search_results:
+        st.info("유사도 0.5 이상의 결과가 없습니다. 검색어를 바꿔 다시 시도해보세요.")
 
 
 # ──────────────────────────────────────────
-# 탭2: 이미지로 검색 (upload.py와 동일한 vibe+태그 벡터)
+# 탭2: 이미지로 검색
 # ──────────────────────────────────────────
-# [핵심] upload.py의 벡터 생성 파이프라인을 그대로 재현:
-#   vibe_text     = generate_image_vibe_description(image)              ← ① DB 앞부분과 동일
-#   metadata_text = "{cat} {colors} {sty} {mat} {neck} {fit} {det}"    ← ② DB 뒷부분과 동일 (brand 제외)
-#   combined_text = f"{vibe_text} {metadata_text}"                      ← upload.py와 동일한 결합 방식
-#   vector        = embed(combined_text, 1408차원)
 with tab2:
     st.caption(
         "옷 이미지를 올리면 AI가 분위기와 태그를 분석해 유사한 아이템을 찾아줍니다. "
@@ -502,26 +704,29 @@ with tab2:
     img_search_file = st.file_uploader(
         "이미지 업로드",
         type=["png", "jpg", "jpeg"],
-        key="img_search_file",
+        key=f"img_search_file_{st.session_state.tab2_reset_counter}",
     )
 
-    if "img_search_results" not in st.session_state:
+    btn_col1, btn_col2 = st.columns([5, 1])
+    with btn_col1:
+        img_search_clicked = st.button(
+            "🔍 이미지로 검색",
+            type="primary",
+            use_container_width=True,
+            key="img_search_btn",
+            disabled=(img_search_file is None),
+        )
+    with btn_col2:
+        img_reset_clicked = st.button("🔄 초기화", use_container_width=True, key="img_reset_btn")
+
+    if img_reset_clicked:
         st.session_state.img_search_results = []
-    if "img_search_vibe" not in st.session_state:
-        st.session_state.img_search_vibe = ""
-    if "img_search_tags" not in st.session_state:
-        st.session_state.img_search_tags = {}
-
-    img_search_clicked = st.button(
-        "🔍 이미지로 검색",
-        type="primary",
-        use_container_width=True,
-        key="img_search_btn",
-        disabled=(img_search_file is None),
-    )
+        st.session_state.img_search_vibe    = ""
+        st.session_state.img_search_tags    = {}
+        st.session_state.tab2_reset_counter += 1
+        st.rerun()
 
     if img_search_file:
-        # 업로드된 이미지 미리보기
         preview_col, _ = st.columns([1, 3])
         with preview_col:
             st.image(img_search_file, caption="업로드된 이미지", use_container_width=True)
@@ -530,11 +735,9 @@ with tab2:
         image_bytes  = img_search_file.getvalue()
         image_for_ai = Image.open(io.BytesIO(image_bytes))
 
-        # Step 1. 이미지 느낌(분위기, 무드) 추출 → combined_text의 ① 앞부분 (upload.py와 동일)
         with st.spinner("🌊 이미지 분위기 분석 중..."):
             vibe_text = generate_image_vibe_description(image_for_ai)
 
-        # Step 2. 패션 태그 추출 → combined_text의 ② 뒷부분 (upload.py와 동일)
         with st.spinner("🏷️ 패션 태그 추출 중..."):
             json_str  = generate_tags(image_for_ai)
             try:
@@ -545,23 +748,26 @@ with tab2:
             except Exception:
                 tags_data = {}
 
-        # Step 3. combined_text 구성 — upload.py와 완전히 동일한 방식
         colors = " ".join(tags_data.get('col', [])) if isinstance(tags_data.get('col'), list) else str(tags_data.get('col', ''))
         if tags_data.get('neck') in ["없음", "None"]: tags_data['neck'] = ""
         metadata_text = f"{tags_data.get('cat','')} {colors} {tags_data.get('sty','')} {tags_data.get('mat','')} {tags_data.get('neck','')} {tags_data.get('fit','')} {tags_data.get('det','')}"
         combined_text = f"{vibe_text} {metadata_text}".strip() if vibe_text else metadata_text
 
-        # Step 4. 임베딩 → Pinecone 검색
         with st.spinner("🔎 유사 아이템 검색 중..."):
             vector = get_text_embedding(combined_text)
             if vector:
-                st.session_state.img_search_results = pinecone_query(vector)
+                # 이미지 검색은 이미지 자체가 성별 컨텍스트를 담고 있으므로
+                # 추출된 태그의 gen으로 post-filter 적용
+                raw_results = pinecone_query(vector, top_k=50)
+                img_structured = {"gen": tags_data.get("gen", ""), "age": tags_data.get("age", ""), "cat": tags_data.get("cat", "")}
+                filtered_results = apply_post_filters(raw_results, img_structured, display_n=12)
+
+                st.session_state.img_search_results = filtered_results
                 st.session_state.img_search_vibe    = vibe_text
                 st.session_state.img_search_tags    = tags_data
             else:
                 st.error("임베딩 생성에 실패했습니다.")
 
-    # 분석 결과 표시 (검색 후 유지)
     if st.session_state.img_search_vibe or st.session_state.img_search_tags:
         with st.expander("🔍 AI 분석 결과 보기", expanded=False):
             if st.session_state.img_search_vibe:
@@ -571,15 +777,18 @@ with tab2:
                 st.markdown("**🏷️ 추출된 태그**")
                 st.json(st.session_state.img_search_tags)
 
-    # 검색 결과 렌더링
     if st.session_state.img_search_results:
         render_search_results(st.session_state.img_search_results, filter_key_prefix="tab2")
     elif img_search_clicked and not img_search_file:
         st.warning("이미지를 업로드해주세요.")
+    elif img_search_clicked and st.session_state.img_search_results == []:
+        st.info("유사도 0.5 이상의 결과가 없습니다. 다른 이미지로 다시 시도해보세요.")
+    elif img_search_clicked and not st.session_state.img_search_results:
+        st.info("유사도 0.5 이상의 결과가 없습니다. 다른 이미지로 다시 시도해보세요.")
 
 
 # ──────────────────────────────────────────
-# 탭3: 이미지로 웹 유사도 검색 (Vision API WEB_DETECTION)
+# 탭3: 이미지로 웹 유사도 검색
 # ──────────────────────────────────────────
 with tab3:
     st.caption("옷 이미지를 올리면 웹에서 유사 이미지·출처 페이지를 찾습니다. (Google Cloud Vision, DB 미사용)")
